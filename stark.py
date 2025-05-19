@@ -56,9 +56,13 @@ class MedibotSystem:
             raise Exception("Not enough empty station slots to spawn all objects uniquely.")
         random.shuffle(available_locations)
         for i in range(OBJECTS):
-            object_id = f"Object{i}"
+            if i<9:
+                object_id = f"Object0{i+1}"
+            else:
+                object_id = f"Object{i+1}"
             station_id, slot_id = available_locations[i]
             self.add_object(object_id, station_id, slot_id)
+            rp(f"{object_id} spawned at {station_id} {slot_id}.")
 
     def register_entity(self, entity_class, entity_id:str, position:Position):
         if entity_class!=AMR and entity_class!=Station and entity_class!=Parking:
@@ -134,34 +138,35 @@ class MedibotSystem:
             return {"message": message, "success": success}
 
         with self.db_lock:
-            self.order_counter +=1
+            self.order_counter += 1
             order_id = str(self.order_counter)
             self.orders[order_id] = Order(order_id=order_id, 
-                                        object_id=object_id, 
-                                        source_station=source_station, 
-                                        destination_station=destination_station, 
-                                        allow_grouping=allow_grouping, 
-                                        priority=priority)
-            self.suboder_counter +=1
+                                            object_id=object_id, 
+                                            source_station=source_station, 
+                                            destination_station=destination_station, 
+                                            allow_grouping=allow_grouping, 
+                                            priority=priority)
+            new_order = self.orders[order_id]
+            self.suboder_counter += 1
             source_suborder_id = str(self.suboder_counter)
             self.suborders[source_suborder_id] = SubOrder(suborder_id=source_suborder_id, 
-                                                    order_id=order_id, 
-                                                    sub_type="pickup", 
-                                                    station_id=source_station.id, 
-                                                    object_id=object_id, 
-                                                    allow_grouping=allow_grouping, 
-                                                    priority=priority)
-            self.suboder_counter +=1
+                                                            order_id=order_id, 
+                                                            sub_type="pickup", 
+                                                            station_id=source_station.id, 
+                                                            object_id=object_id, 
+                                                            allow_grouping=allow_grouping, 
+                                                            priority=priority)
+            self.suboder_counter += 1
             destination_suborder_id = str(self.suboder_counter)
             self.suborders[destination_suborder_id] = SubOrder(suborder_id=destination_suborder_id, 
-                                                    order_id=order_id, 
-                                                    sub_type="delivery", 
-                                                    station_id=destination_station.id, 
-                                                    object_id=object_id, 
-                                                    allow_grouping=allow_grouping, 
-                                                    priority=priority)
-            self.orders[order_id].suborders["pickup"] = self.suborders[source_suborder_id]
-            self.orders[order_id].suborders["delivery"] = self.suborders[destination_suborder_id]
+                                                                order_id=order_id, 
+                                                                sub_type="delivery", 
+                                                                station_id=destination_station.id, 
+                                                                object_id=object_id, 
+                                                                allow_grouping=allow_grouping, 
+                                                                priority=priority)
+            new_order.suborders["pickup"] = self.suborders[source_suborder_id]
+            new_order.suborders["delivery"] = self.suborders[destination_suborder_id]
             
             success = True
             message = f"Order {order_id} created."
@@ -235,7 +240,6 @@ class MedibotSystem:
         if station_available == 0 and amr_available == 0:
             rp(amr_id, station.id, suborders)
             raise Exception("Deadlock: Station and AMR are full.")
-
         # Station full: must prioritize pickup to free space
         if station_available == 0 and amr_available > 0:
             rp("Station full. Prioritizing pickup.")
@@ -244,7 +248,6 @@ class MedibotSystem:
                 rp(f"Suborder {pending_pickups[0].suborder_id} is promoted.")
             else:
                 raise Exception("Deadlock: No pickup available to free station slot.")
-
         # AMR full: must prioritize delivery to free space
         elif amr_available == 0 and station_available > 0:
             rp("AMR full. Prioritizing delivery.")
@@ -266,13 +269,10 @@ class MedibotSystem:
                     promote_element(pending_deliveries[0], suborders)
                     rp(f"Suborder {pending_deliveries[0].suborder_id} is promoted.")
         ic([suborder.suborder_id for suborder in self.tasks[task_id].suborders])
-            
 
     def suborder_execution(self, amr_id, amr:AMR):
         if not isinstance(amr, AMR):
             raise Exception("Unexpected amr type.")
-        rp("Rearranging suborders")
-        self.rearrange_suborders(amr.task_id, amr_id)
         
         # Obtain the first uncompleted suborder
         for suborder in self.tasks[amr.task_id].suborders:
@@ -282,54 +282,60 @@ class MedibotSystem:
                 continue
             break
         suborder_id = suborder.suborder_id
-        rp(f"Executing suborder {suborder_id} for {amr_id}")
-        self.suborders[suborder_id].status = "executing"
         station = self.stations[suborder.station_id]
         order_id = self.suborders[suborder_id].order_id
-        if self.suborders[suborder_id].type == "pickup":
-            rp(f"Suborder is to pickup {suborder.object_id} from {suborder.station_id}")
-            object_slot = self.find_object_in_slots(station, suborder.object_id)
-            pickup_slot = self.find_available_slot(amr)
-            
-            if not pickup_slot or not object_slot:
-                rp(amr.slots)
-                rp(station.slots)
-                rp(f"Reserved slot for order {order_id} not found in AMR.") if not pickup_slot else None
-                rp(f"Object {suborder.object_id} not found in station {suborder.station_id}") if not object_slot else None
-                self.suborders[suborder_id].status = "failed"
-                self.amrs[amr_id].status = "error"
-                return
-            
-            self.amrs[amr_id].slots[pickup_slot]["object_id"] = suborder.object_id
-            station.slots[object_slot]["object_id"] = None
-            station.slots[object_slot]["reservation"].remove(order_id)
-            rp(f"Transferred {suborder.object_id} from {suborder.station_id} {object_slot} to {amr_id} {pickup_slot}")
-
-        elif self.suborders[suborder_id].type == "delivery":
-            rp(f"Suborder is to deliver {suborder.object_id} to {suborder.station_id}")
-            object_slot = self.find_object_in_slots(self.amrs[amr_id], suborder.object_id)
-            delivery_slot = self.get_reserved_slot(station, order_id)
-
-            if not delivery_slot or not object_slot:
-                rp(f"Reserved slot for order {order_id} not found in station.") if not delivery_slot else None
-                rp(f"Object {suborder.object_id} not found in AMR {amr_id}") if not object_slot else None
-                self.suborders[suborder_id].status = "failed"
-                self.amrs[amr_id].status = "error"
-                return
-
-            station.slots[delivery_slot]["object_id"] = suborder.object_id
-            station.slots[delivery_slot]["reservation"].remove(order_id)
-            self.amrs[amr_id].slots[object_slot]["object_id"] = None
-            rp(f"Transferred {suborder.object_id} from {amr_id} {object_slot} to {suborder.station_id} {delivery_slot}")
-
-        else:
-            raise Exception("Invalid suborder type.")
-        self.suborders[suborder_id].status = "completed"
-        time.sleep(1)
+        
+        if suborder.status == "pending":
+            rp("Rearranging suborders")
+            self.rearrange_suborders(amr.task_id, amr_id)
+            rp(f"Executing suborder {suborder_id} for {amr_id}")
+            suborder.status = "executing"
+            if suborder.type == "pickup":
+                rp(f"Suborder is to pickup {suborder.object_id} from {suborder.station_id}")
+                suborder.station_slot = self.find_object_in_slots(station, suborder.object_id)
+                suborder.amr_slot = self.find_available_slot(amr)
+                
+                if not suborder.station_slot or not suborder.amr_slot:
+                    rp(amr.slots)
+                    rp(station.slots)
+                    rp(f"Reserved slot for order {order_id} not found in AMR.") if not suborder.station_slot  else None
+                    rp(f"Object {suborder.object_id} not found in station {suborder.station_id}") if not suborder.amr_slot else None
+                    suborder.status = "failed"
+                    amr.status = "error"
+                    return
+                
+            elif suborder.type == "delivery":
+                rp(f"Suborder is to deliver {suborder.object_id} to {suborder.station_id}")
+                suborder.amr_slot = self.find_object_in_slots(self.amrs[amr_id], suborder.object_id)
+                suborder.station_slot = self.get_reserved_slot(station, order_id)
+                if not suborder.station_slot or not suborder.amr_slot:
+                    rp(f"Reserved slot for order {order_id} not found in station.") if not suborder.station_slot else None
+                    rp(f"Object {suborder.object_id} not found in AMR {amr_id}") if not suborder.amr_slot else None
+                    suborder.status = "failed"
+                    amr.status = "error"
+                    return
+            else:
+                raise Exception("Invalid suborder type.")
+        
+        elif suborder.status == "executing":
+            if suborder.timestep >= SUBORDER_DURATION:
+                if suborder.type == "pickup":
+                    amr.slots[suborder.amr_slot]["object_id"] = suborder.object_id
+                    station.slots[suborder.station_slot]["object_id"] = None
+                    station.slots[suborder.station_slot]["reservation"].remove(order_id)
+                    rp(f"Transferred {suborder.object_id} from {suborder.station_id} {suborder.station_slot} to {amr_id} {suborder.station_slot}")
+                elif suborder.type == "delivery":
+                    station.slots[suborder.station_slot]["object_id"] = suborder.object_id
+                    station.slots[suborder.station_slot]["reservation"].remove(order_id)
+                    amr.slots[suborder.amr_slot]["object_id"] = None
+                    rp(f"Transferred {suborder.object_id} from {amr_id} {suborder.amr_slot} to {suborder.station_id} {suborder.station_slot}")
+                self.suborders[suborder_id].status = "completed"
+            else:
+                suborder.timestep += 1
         return
 
     def cost_based_assignment(self, order:Order):
-        cost_dict = {amr_id: {"cost": 0, "pickup_index": None, "delivery_index": None, "slot_id": None} for amr_id in self.amrs.keys()}
+        cost_dict = {amr_id: {"cost": 0, "pickup_index": None, "delivery_index": None} for amr_id in self.amrs.keys()}
         rp(self.amr_queues)
 
         # Check possibilities
@@ -343,19 +349,23 @@ class MedibotSystem:
                     continue
                 # verify if this task can handle extra pickup
                 rp(queue["expected_states"], task_index)
-                for slot_id, object_id in queue["expected_states"][task_index].items():
-                    if object_id != None:
-                        continue
-                    rp(f"pickup suborder of order {order.order_id} can be assigned to queue{task_index} of {amr_id}, slot {slot_id}")
+                
+                object_count = len(queue["expected_states"][task_index])
+                ic(object_count)
+                if object_count < AMR_SLOT_CAPACITY:
+                    rp(f"pickup suborder of order {order.order_id} can be assigned to queue{task_index} of {amr_id}")
                     cost_dict[amr_id]["pickup_index"] = task_index
-                    cost_dict[amr_id]["slot_id"] = slot_id
                     rp(cost_dict[amr_id])
                     break
+
             if cost_dict[amr_id]["pickup_index"] != None:
                 # found task to inject pickup
-                for task_index, task in enumerate(queue["tasks"][cost_dict[amr_id]["pickup_index"]:]): # start from index after pickup task
+                for task in queue["tasks"][cost_dict[amr_id]["pickup_index"]:]: # start from index after pickup task
+                    task_index = queue["tasks"].index(task)
+                    ic(task_index)
                     if not isinstance(task, Task):
                         raise Exception("Unexpected task type.")
+                    ic(task.station.id, order.destination_station.id)
                     if task.station != order.destination_station:
                         continue
                     # verify if this task can handle extra delivery
@@ -365,33 +375,38 @@ class MedibotSystem:
                 if cost_dict[amr_id]["delivery_index"] != None:
                     continue
 
+            pickup_queue_index = cost_dict[amr_id]["pickup_index"]
+            delivery_queue_index = cost_dict[amr_id]["delivery_index"]
+            amr_cost = cost_dict[amr_id]["cost"]
             # Cost calculation here
             if len(queue["tasks"]) != 0:
                 # add the first station distance cost
-                cost_dict[amr_id]["cost"] += _distance(self.amrs[amr_id].position, queue["tasks"][0].station.position) * DISTANCE_COST
-                cost_dict[amr_id]["cost"] += len(queue["tasks"][0].suborders) * TRANSFER_COST
+                amr_cost += _distance(self.amrs[amr_id].position, queue["tasks"][0].station.position) * DISTANCE_COST
+                amr_cost += len(queue["tasks"][0].suborders) * TRANSFER_COST
             else:
-                cost_dict[amr_id]["cost"] += _distance(self.amrs[amr_id].position, order.source_station.position) * DISTANCE_COST
-
-            if cost_dict[amr_id]["pickup_index"] != None and cost_dict[amr_id]["delivery_index"] != None:
-                for i, task in enumerate(queue["tasks"][1:cost_dict[amr_id]["delivery_index"]]):
-                    cost_dict[amr_id]["cost"] += _distance(task.station.position, queue["tasks"][i-1].station.position) * DISTANCE_COST
-                    cost_dict[amr_id]["cost"] += len(task.suborders) * TRANSFER_COST
-            elif cost_dict[amr_id]["pickup_index"] != None and cost_dict[amr_id]["delivery_index"] == None:
+                amr_cost += _distance(self.amrs[amr_id].position, order.source_station.position) * DISTANCE_COST
+            
+            if pickup_queue_index != None and delivery_queue_index != None:
+                for task in queue["tasks"][1:delivery_queue_index]:
+                    task_index = queue["tasks"].index(task)
+                    amr_cost += _distance(task.station.position, queue["tasks"][task_index-1].station.position) * DISTANCE_COST
+                    amr_cost += len(task.suborders) * TRANSFER_COST
+            elif pickup_queue_index != None and delivery_queue_index == None:
                 # create one new task for delivery
-                for i, task in enumerate(queue["tasks"][1:]): # all cost towards end of queue
-                    cost_dict[amr_id]["cost"] += _distance(task.station.position, queue["tasks"][i-1].station.position) * DISTANCE_COST
-                    cost_dict[amr_id]["cost"] += len(task.suborders) * TRANSFER_COST
+                for task in queue["tasks"][1:]: # all cost towards end of queue
+                    task_index = queue["tasks"].index(task)
+                    amr_cost += _distance(task.station.position, queue["tasks"][task_index-1].station.position) * DISTANCE_COST
+                    amr_cost += len(task.suborders) * TRANSFER_COST
                 # cost of last task to new delivery station
                 cost_dict[amr_id]["cost"] += _distance(queue["tasks"][-1].station.position, order.destination_station.position) * DISTANCE_COST
-            elif cost_dict[amr_id]["pickup_index"] == None and cost_dict[amr_id]["delivery_index"] == None:
+            elif pickup_queue_index == None and delivery_queue_index == None:
                 # create one new task for pickup and one new task for delivery
                 if len(queue["tasks"]) != 0:
                     for i, task in enumerate(queue["tasks"][1:]): # all cost towards end of queue
-                        cost_dict[amr_id]["cost"] += _distance(task.station.position, queue["tasks"][i-1].station.position) * DISTANCE_COST
-                        cost_dict[amr_id]["cost"] += len(task.suborders) * TRANSFER_COST
+                        amr_cost += _distance(task.station.position, queue["tasks"][i-1].station.position) * DISTANCE_COST
+                        amr_cost += len(task.suborders) * TRANSFER_COST
                     rp(queue["tasks"][-1].station, order.source_station)
-                    cost_dict[amr_id]["cost"] += _distance(queue["tasks"][-1].station.position, order.source_station.position) * DISTANCE_COST
+                    amr_cost += _distance(queue["tasks"][-1].station.position, order.source_station.position) * DISTANCE_COST
             else:
                 rp("Invalid scenario in cost calculation, pickup index is None but delivery index is not.")
         costs = {amr_id: cost_dict[amr_id]["cost"] for amr_id in cost_dict.keys()}
@@ -412,7 +427,6 @@ class MedibotSystem:
             order.suborders["pickup"].task_id = pickup_task_id
             rp(self.suborders[order.suborders["pickup"].suborder_id].task_id)
             self.tasks[pickup_task_id].suborders.append(order.suborders["pickup"])
-            # self.rearrange_suborders(pickup_task_id, best_amr_id)
             self.sort_alternating_suborders(pickup_task_id)
             ic([suborder.suborder_id for suborder in self.tasks[pickup_task_id].suborders])
         else:
@@ -425,18 +439,14 @@ class MedibotSystem:
             queue["tasks"].append(self.tasks[pickup_task_id])
             pickup_queue_index = len(queue["tasks"])-1
 
-            # Assuming add task to end of queue, later modify for expected states if insert task within queue
-            expected_states.append({f"slot_{i}":None for i in range(AMR_SLOT_CAPACITY)} if len(expected_states)==0 else copy.copy(expected_states[-1]))
-            for slot_id, object_id in queue["expected_states"][-1].items(): # Check last expected state
-                if object_id == None: # available
-                    cost_dict[best_amr_id]["slot_id"] = slot_id
-                    break
+            # Assuming add task to end of queue, modify for expected states if insert prioritized task within queue
+            expected_states.append(set() if len(expected_states)==0 else copy.copy(expected_states[-1]))
+
         if delivery_queue_index != None:
             delivery_task_id = queue["tasks"][cost_dict[best_amr_id]["delivery_index"]].id
             self.tasks[delivery_task_id].suborders.append(order.suborders["delivery"])
             self.suborders[order.suborders["delivery"].suborder_id].task_id = delivery_task_id
             rp(self.suborders[order.suborders["delivery"].suborder_id].task_id)
-            # self.rearrange_suborders(pickup_task_id, best_amr_id)
             self.sort_alternating_suborders(pickup_task_id)
             ic([suborder.suborder_id for suborder in self.tasks[pickup_task_id].suborders])
         else:
@@ -449,45 +459,12 @@ class MedibotSystem:
             queue["tasks"].append(self.tasks[delivery_task_id])
             delivery_queue_index = len(queue["tasks"])-1
 
-            # Assuming add task to end of queue, later modify for expected states if insert task within queue
+            # Assuming add task to end of queue, modify for expected states if insert prioritized task within queue
             expected_states.append(copy.copy(expected_states[-1])) # also append for delivery states
-            for slot_id, object_id in expected_states[-1].items():
-                if object_id == order.object_id:
-                    expected_states[slot_id] = None
 
-        slot_to_assign = cost_dict[best_amr_id]["slot_id"]
-        for state_index, state in enumerate(expected_states[pickup_queue_index:delivery_queue_index]):
-            rp(slot_to_assign)
-            state[slot_to_assign] = order.object_id
+        for state in expected_states[pickup_queue_index:delivery_queue_index]:
+            state.add(order.object_id)
 
-    # def amr_slot_reservation(self, amr:AMR):
-    #     pickup_suborders = len([suborder for suborder in amr.task.suborders if (suborder.type=="pickup" and suborder.status=="pending")])
-    #     delivery_suborders = len([suborder for suborder in amr.task.suborders if (suborder.type=="delivery" and suborder.status=="pending")])
-    #     available_slots = len([slot for slot in amr.slots.values() if slot["object_id"] == None])
-    #     rp(f"{amr.id} has {available_slots} available_slots, pickup suborders: {pickup_suborders}, delivery_suborders: {delivery_suborders}")
-    #     if available_slots < pickup_suborders - delivery_suborders:
-    #         raise Exception("Not enough available slots for pickup and delivery suborders of current task.")
-
-    # def pickup_slot_reservation(self, amr:AMR):
-    #     station = self.stations[amr.task.station.id]
-    #     pickup_suborders = [suborder for suborder in amr.task.suborders if (suborder.type=="pickup" and suborder.status=="pending")]
-    #     for slot_id, slot in station.slots.items():
-    #         for suborder in pickup_suborders:
-    #             if slot["object_id"] == suborder.object_id:
-    #                 slot["reservation"] = suborder.order_id
-    #                 rp(f"{amr.id} reserved {station.id} {slot_id} for order {suborder.order_id} {suborder.type}")
-    #                 break    
-
-    # def delivery_slot_reservation(self, amr:AMR):
-    #     station = self.stations[amr.task.station.id]
-    #     delivery_suborders = [suborder for suborder in amr.task.suborders if (suborder.type=="delivery" and suborder.status=="pending")]
-    #     available_slots = [slot_id for slot_id, slot in station.slots.items() if slot["object_id"] == None and slot["reservation"] == None]
-    #     rp(f"{station.id} has {len(available_slots)} available slots")
-    #     if len(available_slots) < len(delivery_suborders):
-    #         raise Exception("Not enough available slots for delivery suborders of current task.")
-    #     for index, suborder in enumerate(delivery_suborders):
-    #         station.slots[available_slots[index]]["reservation"] = suborder.order_id
-    #         rp(f"{amr.id} reserved {station.id} {available_slots[index]} for order {suborder.order_id} {suborder.type}")
     def amr_slot_reservation(self, amr: AMR):
         pickup_suborders = len([s for s in amr.task.suborders if s.type == "pickup" and s.status == "pending"])
         delivery_suborders = len([s for s in amr.task.suborders if s.type == "delivery" and s.status == "pending"])
@@ -508,38 +485,43 @@ class MedibotSystem:
             if slot["object_id"] is None and (not slot.get("reservation") or len(slot["reservation"]) == 0)
         ]
         available_slot_queue = real_available_slots.copy()
-        # Simulated available slots counter
         simulated_available = len(real_available_slots)
         for suborder in suborders:
-            ic(available_slot_queue, simulated_available)
-
-            ic(suborder.suborder_id, suborder.type)
             if suborder.type == "pickup":
                 # Reserve the slot where the object is
                 for slot_id, slot in station.slots.items():
-                    if slot["object_id"] == suborder.object_id:
-                        if suborder.order_id not in slot["reservation"]:
-                            slot["reservation"].append(suborder.order_id)
-                            rp(f"{amr.id} reserved {station.id} {slot_id} for order {suborder.order_id} (pickup)")
-                        # After pickup, this slot will become free
-                        simulated_available += 1
-                        available_slot_queue.append(slot_id)  # Now reusable
-                        break
+                    if slot["object_id"] != suborder.object_id:
+                        continue
+                    if suborder.order_id not in slot["reservation"]:
+                        slot["reservation"].append(suborder.order_id)
+                        rp(f"{amr.id} reserved {station.id} {slot_id} for order {suborder.order_id} (pickup)")
+                    # After pickup, this slot will become free
+                    simulated_available += 1
+                    available_slot_queue.append(slot_id)  # Now reusable
+                    break
 
             elif suborder.type == "delivery":
                 if simulated_available <= 0:
                     raise Exception("Not enough effective station slots to schedule delivery suborders in task.")
                 simulated_available -= 1
-
-                # Assign a real slot
                 if not available_slot_queue:
                     raise Exception("Logic error: simulated_available mismatch real available slots.")
-
                 slot_id = available_slot_queue.pop(0)
                 slot = station.slots[slot_id]
                 if suborder.order_id not in slot["reservation"]:
                     slot["reservation"].append(suborder.order_id)
                     rp(f"{amr.id} reserved {station.id} {slot_id} for order {suborder.order_id} (delivery)")
+
+    def amr_state_validation(self, amr:AMR):
+        actual_objects = {slot["object_id"] for slot in amr.slots.values() if slot["object_id"] is not None}
+        actual_nones = sum(1 for slot in amr.slots.values() if slot["object_id"] is None)
+        expected_objects = self.amr_queues[amr.id]["expected_states"][0]
+        expected_nones = AMR_SLOT_CAPACITY - len(expected_objects)
+        if actual_objects != expected_objects:
+            raise Exception(f"Object mismatch. Expected: {expected_objects}, Got: {actual_objects}")
+        if actual_nones != expected_nones:
+            raise Exception(f"Empty slot mismatch. Expected {expected_nones} empty slots, got {actual_nones}")
+        print("AMR state is valid: Correct objects and correct number of empty slots.")
 
     def step(self):
         if not self.paused:
@@ -559,10 +541,7 @@ class MedibotSystem:
                         rp(f"{amr.id} arrived at goal") if amr.is_moving else None
                         amr.is_moving = False
                         if all([suborder.status=="completed" for suborder in self.tasks[amr.task_id].suborders]):
-                            amr_current_slot_states = {slot_id: slot["object_id"] for slot_id, slot in amr.slots.items()}
-                            if amr_current_slot_states!= queue["expected_states"][0]:
-                                rp(amr_current_slot_states, queue["expected_states"][0])
-                                raise Exception(f"{amr_id} did not meet expected states.")
+                            self.amr_state_validation(amr)
                             self.tasks[amr.task_id].status = "completed"
                             amr.status = "idle"
                             amr.task_id = None

@@ -53,7 +53,9 @@ class SubOrder:
         self.priority = priority
         self.status = "pending" # pending, completed, failed
         self.task_id = None
-
+        self.amr_slot = None
+        self.station_slot = None
+        self.timestep = 0
 class Order:
     def __init__(self, order_id, source_station, destination_station, object_id, allow_grouping=True, priority=100):
         self.order_id = order_id
