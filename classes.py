@@ -72,7 +72,8 @@ class Task:
     def __init__(self, task_id, assigned_amr, station):
         self.id = task_id
         self.assigned_amr = assigned_amr
-        self.status = "queued"    # queued, executing, completed, failed
+        self.status = "queued"    # queued, executing, completed, failed, sleep
         self.station = station
         self.suborders = [] # [SubOrder]
         self.time_stamp = time.time()
+        print(f"Task {self.id} created")

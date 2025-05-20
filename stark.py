@@ -523,6 +523,137 @@ class MedibotSystem:
             raise Exception(f"Empty slot mismatch. Expected {expected_nones} empty slots, got {actual_nones}")
         print("AMR state is valid: Correct objects and correct number of empty slots.")
 
+    def pre_task_validation(self, amr:AMR, task:Task):
+        has_valid_suborder = False
+        queue = self.amr_queues[amr.id]
+
+        if len(queue["tasks"]) == 0:
+            print(f"AMR has no task queue")
+            return
+        station = task.station
+        if not isinstance(station, Station):
+            raise Exception("Unexpected station type.")
+        if station.status != "idle":
+            print(f"Station is not idle")
+            return
+
+        suborders = task.suborders
+        original_suborders = suborders.copy()
+        pickup_suborders = [s for s in suborders if s.type == "pickup"]
+        delivery_suborders = [s for s in suborders if s.type == "delivery"]
+        station_objects = {slot["object_id"] for slot in station.slots.values() if slot["object_id"] is not None}
+        station_real_available_slots = len([slot_id for slot_id, slot in station.slots.items() if slot["object_id"] is None])
+        amr_objects = {slot["object_id"] for slot in amr.slots.values() if slot["object_id"] is not None}
+        amr_real_available_slots = len([slot_id for slot_id, slot in amr.slots.items() if slot["object_id"] is None])
+        invalid_pickup_suborders = {s for s in pickup_suborders if s.object_id not in station_objects}
+        invalid_delivery_suborders = {s for s in delivery_suborders if s.object_id not in amr_objects}
+        
+        for invalid_pickup in invalid_pickup_suborders:
+            invalid_pickup.status = "failed"
+            print(f"Cant pickup object {invalid_pickup.object_id} from station {station.id}")
+        for invalid_delivery in invalid_delivery_suborders:
+            invalid_delivery.status = "failed"
+            print(f"Cant deliver object {invalid_delivery.object_id} to station {station.id}")
+
+        suborders = list(set(suborders) - invalid_pickup_suborders - invalid_delivery_suborders)
+        if len(suborders) == 0:
+            return has_valid_suborder
+
+        pickup_suborders = [s for s in suborders if s.type == "pickup"]
+        delivery_suborders = [s for s in suborders if s.type == "delivery"]
+
+        delayed_pickup = []
+        delayed_delivery = []
+        station_required_slots = max(0, len(delivery_suborders) - len(pickup_suborders))
+        amr_required_slots = max(0, len(pickup_suborders) - len(delivery_suborders))
+        if station_real_available_slots < station_required_slots:
+            n_delivery_to_remove = station_required_slots - station_real_available_slots
+            if len(delivery_suborders) == n_delivery_to_remove:
+                delayed_delivery = delivery_suborders.copy()
+                delivery_suborders = []
+            else:
+                delivery_suborders = delivery_suborders[:len(delivery_suborders)-n_delivery_to_remove]
+                delayed_delivery = delivery_suborders[:n_delivery_to_remove]
+        if amr_real_available_slots < amr_required_slots:
+            n_order_to_remove = amr_required_slots - amr_real_available_slots
+            pickup_suborders = pickup_suborders[n_order_to_remove:]
+            delayed_pickup = pickup_suborders[:n_order_to_remove]
+
+        task.suborders = pickup_suborders + delivery_suborders
+        if len(task.suborders) != 0:
+            task.status = "queued"
+            has_valid_suborder = True
+        print(f"Task {task.id} has {'no ' if not has_valid_suborder else ''}valid suborders")
+
+        if delayed_pickup:
+            for suborder in delayed_pickup:
+                order = self.orders[suborder.order_id]
+                order.suborders["pickup"].task_id = None
+                order.suborders["delivery"].task_id = None
+        if delayed_delivery:
+            for suborder in delayed_delivery:
+                print(f"Delayed {suborder.object_id} delivery to station {suborder.station_id}")
+        if set(original_suborders) == set(delayed_delivery):
+            print("putting task to sleep")
+            task.status = "sleep"
+            task.suborders = delayed_delivery
+        
+        self.update_expected_states(amr) if any(delayed_pickup) or any(delayed_delivery) else None
+        return has_valid_suborder
+
+
+    def update_expected_states(self, amr:AMR):
+        queue = self.amr_queues[amr.id]
+        amr_current_objects = {slot["object_id"] for slot in amr.slots.values() if slot["object_id"] is not None}
+        for task_index, task in enumerate(queue["tasks"]):
+            expected_states = queue["expected_states"]
+            expected_states[task_index] = amr_current_objects.copy() if task_index == 0 else expected_states[task_index-1].copy()
+            pickup_objects = {suborder.object_id for suborder in task.suborders if suborder.type == "pickup"}
+            delivery_objects = {suborder.object_id for suborder in task.suborders if suborder.type == "delivery"}
+            expected_states[task_index] = expected_states[task_index].union(pickup_objects)
+            expected_states[task_index] = expected_states[task_index].difference(delivery_objects)
+        rp(f"{amr.id} task queue: {[task.id for task in queue['tasks']]}")
+        rp(f"{amr.id} expected states: {queue['expected_states']}")
+
+    def order_validation(self):
+        pass
+
+    def rearrange_amr_queue(self, amr:AMR):
+        # check if all task has any valid delivery
+        # if totally no valid task to do, sleep and no rearrange
+        # if have valid task, do it and delay invalid
+        if len(self.amr_queues[amr.id]["tasks"]) == 0:
+            return
+        for queue_index, task in enumerate(self.amr_queues[amr.id]["tasks"]):
+            if not isinstance(task, Task):
+                raise Exception("Unexpected task type.")
+            has_valid_suborder = self.pre_task_validation(self.amrs[amr.id], task)
+            ic(has_valid_suborder)
+            # if not has_valid_suborder:
+            #     self.amr_queues[amr.id]["tasks"].append(self.amr_queues[amr.id]["tasks"].pop(0))
+            if has_valid_suborder:
+                task.station.status = "busy"
+                self.sort_alternating_suborders(task.id)
+                amr.status = "busy"
+                amr.task = task
+                amr.task_id = task.id
+                amr.goal_timestamp = time.time()
+                amr.goal = task.station.position
+                task.status = "executing"
+                self.amr_slot_reservation(amr)
+                self.station_slot_reservation(amr)
+                rp(f"{amr.id} is moving to task goal")
+                break
+        
+        if not has_valid_suborder:
+            print(f"All suborders in task in {amr.id} queue are invalid")
+            ic(self.amr_queues[amr.id]["tasks"][0].suborders)
+            ic(self.amr_queues[amr.id])
+        if self.amr_queues[amr.id]["tasks"][0].status == "sleep":
+            print(f"first task in {amr.id} queue is sleep, putting to last")
+            self.amr_queues[amr.id]["tasks"].append(self.amr_queues[amr.id]["tasks"].pop(0))
+            self.update_expected_states(amr)
+
     def step(self):
         if not self.paused:
             for amr_id, amr in self.amrs.items():
@@ -531,6 +662,7 @@ class MedibotSystem:
                 queue = self.amr_queues[amr_id]
                 if len(queue["tasks"]) == 0 and amr.is_parked:
                     continue
+                # ic(amr.status)
                 if amr.status == "busy" and amr.task_id is not None:
                     if not np.allclose([amr.position.x, amr.position.y], [amr.goal.x, amr.goal.y], atol=0.01):
                         self.move_to_goal(amr_id, amr)
@@ -549,7 +681,7 @@ class MedibotSystem:
                         self.suborder_execution(amr_id, amr)
                         continue
                 if amr.status == "idle":
-                    if len(queue["tasks"]) == 0:
+                    if sum(1 for task in queue["tasks"] if task.status =="queued") == 0:
                         # no more task for this amr
                         amr.goal = self.parkings[amr_id].position
                         if not np.allclose([amr.position.x, amr.position.y], [amr.goal.x, amr.goal.y], atol=0.01):
@@ -557,7 +689,7 @@ class MedibotSystem:
                             self.move_to_goal(amr_id, amr)
                             amr.is_moving = True
                         else:
-                            rp(f"{amr_id} arrived parking") if not amr.is_moving else None
+                            rp(f"{amr_id} arrived parking") if amr.is_moving else None
                             amr.is_moving = False
                             amr.is_parked = True
                         continue
@@ -567,26 +699,18 @@ class MedibotSystem:
                         raise Exception("Unexpected task type.")
                     if task.status == "completed":
                         rp(f"Task {task_id} completed")
+                        task.station.status = "idle"
                         self.tasks_history[task_id] = task
                         self.tasks.pop(task_id)
                         queue["tasks"].pop(0)
                         queue["expected_states"].pop(0)
+                        ic(queue)
                         continue
                     if task.status == "failed":
                         rp(f"Task {task_id} failed, waiting for user to cancel")
                         continue
-                    if task.status == "queued":
-                        rp(f"Task {task_id} queued, assigning to {amr_id}")
-                        self.sort_alternating_suborders(task_id)
-                        amr.status = "busy"
-                        amr.task = task
-                        amr.task_id = task_id
-                        amr.goal_timestamp = time.time()
-                        amr.goal = task.station.position
-                        task.status = "executing"
-                        self.amr_slot_reservation(amr)
-                        self.station_slot_reservation(amr)
-                        rp(f"{amr_id} is moving to task goal")
+                    if task.status == "queued" or task.status == "sleep":
+                        self.rearrange_amr_queue(amr)
                         continue
 
         completed_orders = []
@@ -608,17 +732,17 @@ class MedibotSystem:
                         order.status = "failed"
                         rp(f"Order {order_id} {order.status}.")
                         continue
-                    if any([suborder.task_id is None for suborder in order.suborders.values()]):
-                        rp(f"One of the suborder of order {order_id} not yet assigned")
-                        for suborder_id, suborder in order.suborders.items(): # force initialize again for both suborder
-                            if suborder.task_id is not None:
-                                rp(f"{suborder.type} suborder {suborder_id} already assigned, removing from task {suborder.task_id}")
-                                self.tasks[suborder.task_id].suborders.remove(suborder_id)
-                            order.assigned_amr = None
-                            suborder.task_id = None 
-                            suborder.status = "pending"
-                    if all([suborder.task_id is None for suborder in order.suborders.values()]):
+                    
+                    pickup_pending = order.suborders["pickup"].status == "pending" and order.suborders["pickup"].task_id is None
+                    if pickup_pending:
+                        order.assigned_amr = None
+                        order.suborders["delivery"].status = "pending"
+                        order.suborders["delivery"].task_id = None
+                        self.order_validation()
                         self.cost_based_assignment(order)
+                        self.update_expected_states(self.amrs[order.assigned_amr])
+
+                        # loop for all queue task for same station and merge suborder
             for order_id in completed_orders:
                 self.orders.pop(order_id)
 
