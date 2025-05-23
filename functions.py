@@ -1,4 +1,4 @@
-from classes import Position
+from classes import Position, Task
 import numpy as np
 
 def _distance(pos1:Position, pos2:Position):
@@ -15,3 +15,11 @@ def promote_element(element, lst):
         lst.insert(0, element)
     except ValueError:
         pass
+
+# def effective_slot(task:Task):
+#     suborders = task.suborders
+#     pickup_suborders = [s for s in suborders if s.type == "pickup"]
+#     delivery_suborders = [s for s in suborders if s.type == "delivery"]
+#     station_required_slots = max(0, len(delivery_suborders) - len(pickup_suborders))
+#     amr_required_slots = max(0, len(pickup_suborders) - len(delivery_suborders))
+#     return station_required_slots, amr_required_slots
